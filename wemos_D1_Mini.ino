@@ -1,64 +1,27 @@
 #include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <FS.h> // For SPIFFS
+#include <ESPAsyncWebServer.h>
+#include <FS.h>
+#include <ArduinoJson.h>
 
-ESP8266WebServer server(80);
+AsyncWebServer server(80);
 
 #define LED_PIN D4
 
-String ssid = "";
-String password = "";
-bool ledState = false;
+enum class LEDState { OFF, ON };
+LEDState ledState = LEDState::OFF;
 
-void loadWiFiCredentials() {
-  if (SPIFFS.begin()) {
-    if (SPIFFS.exists("/wifi.json")) {
-      File file = SPIFFS.open("/wifi.json", "r");
-      if (file) {
-        String content = file.readString();
-        int separator = content.indexOf(";");
-        if (separator != -1) {
-          ssid = content.substring(0, separator);
-          password = content.substring(separator + 1);
-        }
-        file.close();
-      }
-    }
-  }
-}
+struct WiFiCredentials {
+    String ssid;
+    String password;
+};
 
-void saveWiFiCredentials(const String& newSSID, const String& newPassword) {
-  ssid = newSSID;
-  password = newPassword;
-  File file = SPIFFS.open("/wifi.json", "w");
-  if (file) {
-    file.print(ssid + ";" + password);
-    file.close();
-  }
-  WiFi.disconnect();
-  WiFi.begin(ssid.c_str(), password.c_str());
+WiFiCredentials wifiCredentials;
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-    delay(1000);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    server.send(200, "text/plain", "success");
-  } else {
-    server.send(500, "text/plain", "failure");
-  }
-}
-
-void handleRoot() {
-  String ledColor = (ledState ? "green" : "red");
-  String html = R"rawliteral(
+const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-  <title>WiFi Setup</title>
+  <title>LED Control</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     * {
@@ -119,8 +82,12 @@ void handleRoot() {
       opacity: 0.9;
     }
 
-    .led {
-      background: )rawliteral" + ledColor + R"rawliteral(;
+    .led.on {
+      background: green;
+      color: white;
+    }
+    .led.off {
+      background: red;
       color: white;
     }
 
@@ -143,7 +110,6 @@ void handleRoot() {
     .wifi-icon {
         width: 30px;
         height: 30px;
-         /* Remove the background image */
     }
   </style>
   <script>
@@ -152,11 +118,24 @@ void handleRoot() {
         xhr.open('GET', '/toggle', true);
         xhr.onload = function() {
             if (xhr.status >= 200 && xhr.status < 300) {
-                var ledButton = document.querySelector('.led');
-                ledButton.textContent = (ledButton.textContent === 'LED ON') ? 'LED OFF' : 'LED ON';
-                ledButton.style.background = (ledButton.style.background === 'green') ? 'red' : 'green';
+                try {
+                    var jsonResponse = JSON.parse(xhr.responseText);
+                    var ledButton = document.querySelector('.led');
+                    if (jsonResponse.state === true) {
+                        ledButton.textContent = 'LED ON';
+                        ledButton.classList.remove('off');
+                        ledButton.classList.add('on');
+                    } else {
+                        ledButton.textContent = 'LED OFF';
+                        ledButton.classList.remove('on');
+                        ledButton.classList.add('off');
+                    }
+                } catch (e) {
+                    console.error('Error parsing JSON:', e);
+                    alert('Error updating LED state.');
+                }
             } else {
-                alert('Request failed.  Returned status of ' + xhr.status);
+                alert('Request failed. Returned status of ' + xhr.status);
             }
         };
         xhr.onerror = function() {
@@ -172,16 +151,13 @@ void handleRoot() {
         <div class="wifi-icon">W</div>
     </a>
     <h2>LED Control</h2>
-    <button class="btn led primary-btn" onclick="toggleLED()">)rawliteral" + (ledState ? "LED ON" : "LED OFF") + R"rawliteral(</button>
+    <button class="btn led %LED_STATE_CLASS%" onclick="toggleLED()">%LED_TEXT%</button>
   </div>
 </body>
 </html>
 )rawliteral";
-  server.send(200, "text/html", html);
-}
 
-void handleWifiConfig() {
-    String html = R"rawliteral(
+const char wifi_config_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -260,7 +236,6 @@ void handleWifiConfig() {
       border-radius: 25px;
       margin-top: 0.3rem;
     }
-    /* Colors */
     .primary-btn {
       background: #6C63FF;
       color: white;
@@ -268,18 +243,18 @@ void handleWifiConfig() {
     .wifi-icon {
         width: 30px;
         height: 30px;
-          /* Remove the background image */
     }
-    /* Success message */
     .success-message {
       color: green;
       margin-top: 10px;
     }
-
-    /* Error message */
     .error-message {
       color: red;
       margin-top: 10px;
+    }
+    .ip-address {
+      font-weight: bold;
+      color: #6C63FF;
     }
   </style>
   <script>
@@ -292,12 +267,9 @@ void handleWifiConfig() {
         xhr.open('GET', '/save?ssid=' + ssid + '&password=' + password, true);
         xhr.onload = function() {
             if (xhr.status >= 200 && xhr.status < 300) {
-                // Success
                 document.getElementById('statusMessage').textContent = "Successfully saved WiFi credentials!";
                 document.getElementById('currentIP').textContent = "Please wait while we attempt to connect...";
-              
-
-                   var xhrIP = new XMLHttpRequest();
+                    var xhrIP = new XMLHttpRequest();
                     xhrIP.open('GET', '/getIP', true);
                     xhrIP.onload = function() {
                          if (xhrIP.status >= 200 && xhrIP.status < 300) {
@@ -307,7 +279,7 @@ void handleWifiConfig() {
                          }
                          setTimeout(function() {
                               window.location.href = '/';
-                         }, 5000); // Redirect after 5 seconds
+                         }, 5000);
                     };
                     xhrIP.onerror = function() {
                           document.getElementById('currentIP').textContent = "IP Address: Not Connected";
@@ -315,7 +287,6 @@ void handleWifiConfig() {
                     xhrIP.send();
 
             } else {
-                // Failure
                 document.getElementById('statusMessage').textContent = "Failed to save WiFi credentials.";
             }
         };
@@ -331,48 +302,110 @@ void handleWifiConfig() {
 <div class="container">
     <h2>WiFi Configuration</h2>
     <p id="statusMessage" class="status-info"></p>
-    <p id = "currentIP"  class="status-info">WiFi Mode: )rawliteral" + String(WiFi.getMode() == WIFI_STA ? "STA" : "AP") + R"rawliteral(</p>
-    
+    <p id="currentIP" class="status-info">WiFi Mode: %WIFI_MODE% | IP Address: <span class="ip-address">%IP_ADDRESS%</span></p>
+
     <div class="input-group">
       <label for="ssid">SSID:</label>
-      <input type="text" id="ssid" name="ssid" value=")rawliteral" + ssid + R"rawliteral(">
+      <input type="text" id="ssid" name="ssid" value="%SSID%">
     </div>
     <div class="input-group">
       <label for="password">Password:</label>
-      <input type="password" id="password" name="password" value=")rawliteral" + password + R"rawliteral(">
+      <input type="password" id="password" name="password" value="%PASSWORD%">
     </div>
     <button class="btn primary-btn" onclick="saveWiFi()">Save WiFi</button>
 </div>
 </body>
 </html>
 )rawliteral";
-  server.send(200, "text/html", html);
+
+void loadWiFiCredentials() {
+  if (SPIFFS.begin() && SPIFFS.exists("/wifi.json")) {
+    File file = SPIFFS.open("/wifi.json", "r");
+    if (file) {
+      String content = file.readString();
+      int separator = content.indexOf(";");
+      if (separator != -1) {
+        wifiCredentials.ssid = content.substring(0, separator);
+        wifiCredentials.password = content.substring(separator + 1);
+      }
+      file.close();
+    }
+  }
 }
 
-void handleToggleLED() {
-  ledState = !ledState;
-  digitalWrite(LED_PIN, ledState ? LOW : HIGH);
-  server.send(200, "text/plain", "Toggled");
+void connectWifi() {
+    WiFi.disconnect();
+    WiFi.begin(wifiCredentials.ssid.c_str(), wifiCredentials.password.c_str());
+    Serial.println("Attempting to connect to WiFi...");
 }
+
+void saveWiFiCredentials(const String& newSSID, const String& newPassword) {
+  wifiCredentials.ssid = newSSID;
+  wifiCredentials.password = newPassword;
+  File file = SPIFFS.open("/wifi.json", "w");
+  if (file) {
+    file.print(wifiCredentials.ssid + ";" + wifiCredentials.password);
+    file.close();
+  }
+  connectWifi();
+}
+
+String prepareHtml(const char* html) {
+  String page = FPSTR(html);
+
+  if (html == index_html) {
+      String ledText = (ledState == LEDState::ON) ? "LED ON" : "LED OFF";
+      String ledClass = (ledState == LEDState::ON) ? "on" : "off";
+
+      page.replace("%LED_TEXT%", ledText);
+      page.replace("%LED_STATE_CLASS%", ledClass);
+  } else if (html == wifi_config_html) {
+      page.replace("%SSID%", wifiCredentials.ssid);
+      page.replace("%PASSWORD%", wifiCredentials.password);
+      page.replace("%WIFI_MODE%", String(WiFi.getMode() == WIFI_STA ? "STA" : "AP"));
+      page.replace("%IP_ADDRESS%", getIPAddress());
+  }
+
+  return page;
+}
+
+void handleRoot(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", prepareHtml(index_html));
+}
+
+void handleWifiConfig(AsyncWebServerRequest *request) {
+  request->send(200, "text/html", prepareHtml(wifi_config_html));
+}
+
+void handleToggleLED(AsyncWebServerRequest *request) {
+  ledState = (ledState == LEDState::ON) ? LEDState::OFF : LEDState::ON;
+  digitalWrite(LED_PIN, ledState == LEDState::ON ? LOW : HIGH);
+
+  DynamicJsonDocument jsonDoc(1024);
+  jsonDoc["state"] = (ledState == LEDState::ON);
+  String jsonString;
+  serializeJson(jsonDoc, jsonString);
+
+  request->send(200, "application/json", jsonString);
+}
+
 String getIPAddress() {
-    if (WiFi.status() == WL_CONNECTED) {
-        return WiFi.localIP().toString();
+    return (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "Not Connected";
+}
+
+void handleSave(AsyncWebServerRequest *request) {
+    if (request->hasArg("ssid") && request->hasArg("password")) {
+        saveWiFiCredentials(request->arg("ssid"), request->arg("password"));
+        request->send(200, "text/plain", "Credentials saved. Attempting to connect...");
     } else {
-        return "Not Connected";
+        request->send(400, "text/plain", "Missing SSID or Password");
     }
 }
-void handleSave() {
-    if (server.hasArg("ssid") && server.hasArg("password")) {
-        String newSSID = server.arg("ssid");
-        String newPassword = server.arg("password");
-        saveWiFiCredentials(newSSID, newPassword);
-    } else {
-        server.send(400, "text/plain", "Missing SSID or Password");
-    }
+
+void handleGetIP(AsyncWebServerRequest *request) {
+    request->send(200, "text/plain", getIPAddress());
 }
-void handleGetIP() {
-    server.send(200, "text/plain", getIPAddress());
-}
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED_PIN, OUTPUT);
@@ -383,36 +416,29 @@ void setup() {
 
   WiFi.mode(WIFI_AP_STA);
 
-  if (ssid.length() > 0 && password.length() > 0) {
-    WiFi.begin(ssid.c_str(), password.c_str());
-    Serial.println("Attempting to connect to WiFi...");
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-      delay(1000);
-      Serial.print(".");
-      attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Connected to WiFi: " + WiFi.localIP().toString());
-    } else {
-      Serial.println("Failed to connect. Continuing in AP mode.");
-    }
+  if (wifiCredentials.ssid.length() > 0 && wifiCredentials.password.length() > 0) {
+    connectWifi();
   }
 
   WiFi.softAP("CustomWiFiSetup");
   Serial.println("Access Point Started: CustomWiFiSetup");
   Serial.println("Connect to this network and go to 192.168.4.1");
 
-  server.on("/", handleRoot);
-  server.on("/wificonfig", handleWifiConfig);
-  server.on("/toggle", handleToggleLED);
-  server.on("/save", handleSave);
-  server.on("/getIP", handleGetIP);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/wificonfig", HTTP_GET, handleWifiConfig);
+  server.on("/toggle", HTTP_GET, handleToggleLED);
+  server.on("/save", HTTP_GET, handleSave);
+  server.on("/getIP", HTTP_GET, handleGetIP);
 
   server.begin();
   Serial.println("Web server started.");
 }
 
 void loop() {
-  server.handleClient();
+  if (WiFi.status() == WL_CONNECTED) {
+    //Serial.println("Connected to WiFi: " + WiFi.localIP().toString());
+  } else {
+    //Serial.println("WiFi not connected...");
+  }
+  delay(2000);
 }
